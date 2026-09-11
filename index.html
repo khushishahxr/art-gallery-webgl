@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Interactive Gallery (A-Frame)</title>
+    <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+
+    <style>
+      /* Info panel */
+      #ui {
+        position: fixed;
+        left: 24px;
+        bottom: 24px;
+        width: 380px;
+        max-width: calc(100vw - 48px);
+        padding: 14px 16px;
+        border-radius: 14px;
+        background: rgba(0, 0, 0, 0.78);
+        color: white;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        display: none;
+        z-index: 9999;
+        backdrop-filter: blur(6px);
+      }
+      #ui h3 { margin: 0 0 6px; font-size: 16px; font-weight: 650; }
+      #ui p { margin: 0; font-size: 13px; line-height: 1.35; opacity: 0.92; }
+
+      #hint {
+        position: fixed;
+        left: 24px;
+        top: 24px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: rgba(0, 0, 0, 0.55);
+        color: white;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+        font-size: 12px;
+        z-index: 9999;
+        user-select: none;
+      }
+      #hint strong { font-weight: 650; }
+
+      /* QUIZ MODAL */
+      #quizModal {
+        position: fixed;
+        inset: 0;
+        display: none;
+        z-index: 100000;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      }
+      #quizBackdrop {
+        position: absolute;
+        inset: 0;
+        background: rgba(0,0,0,0.55);
+        backdrop-filter: blur(6px);
+      }
+      #quizCard {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        transform: translate(-50%, -50%);
+        width: min(760px, calc(100vw - 48px));
+        background: rgba(16,16,16,0.92);
+        color: white;
+        border-radius: 18px;
+        padding: 18px;
+        box-shadow: 0 18px 60px rgba(0,0,0,0.55);
+      }
+      #quizTitle { margin: 0 0 10px; font-size: 18px; font-weight: 750; }
+      #quizQuestion { margin: 0 0 12px; font-size: 14px; line-height: 1.35; opacity: 0.95; }
+
+      .opt {
+        width: 100%;
+        text-align: left;
+        padding: 12px 12px;
+        margin: 8px 0;
+        border-radius: 12px;
+        border: 1px solid rgba(255,255,255,0.15);
+        background: rgba(255,255,255,0.08);
+        color: white;
+        cursor: pointer;
+        font-weight: 650;
+      }
+      .opt:hover { background: rgba(255,255,255,0.14); }
+
+      #quizFooter {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-top: 12px;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      #quizFeedback { font-size: 13px; opacity: 0.9; }
+      .btn {
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 0;
+        cursor: pointer;
+        font-weight: 750;
+      }
+      .btnPrimary { background: white; color: black; }
+      .btnGhost { background: rgba(255,255,255,0.12); color: white; }
+    </style>
+
+    <script>
+      // =========================================
+      // AUDIO: robust unlock (WebAudio resume + warm-up)
+      // =========================================
+      let currentlyPlayingSoundEntity = null;
+      let audioUnlocked = false;
+
+      async function unlockAudioOnce() {
+        try {
+          const ctx = AFRAME.audioContext;
+          if (ctx && ctx.state === "suspended") await ctx.resume();
+        } catch (e) {}
+
+        const audios = document.querySelectorAll("audio");
+        audios.forEach(a => {
+          try {
+            a.muted = true;
+            const p = a.play();
+            if (p && p.then) {
+              p.then(() => {
+                a.pause();
+                a.currentTime = 0;
+                a.muted = false;
+              }).catch(() => { a.muted = false; });
+            } else {
+              a.pause(); a.currentTime = 0; a.muted = false;
+            }
+          } catch (e) {}
+        });
+
+        audioUnlocked = true;
+        window.removeEventListener("click", unlockAudioOnce);
+      }
+      window.addEventListener("click", unlockAudioOnce);
+
+      // =========================================
+      // COLLISIONS + FLOOR HEIGHT (custom controller)
+      // =========================================
+      AFRAME.registerComponent("colliding-controls", {
+        schema: {
+          speed: { type: "number", default: 2.6 },   // walking speed
+          radius: { type: "number", default: 0.25 }, // player "body" radius
+          eyeHeight: { type: "number", default: 0.9 },// camera height above floor
+          gravity: { type: "number", default: 18.0 }, // stronger = snappier to ground
+          groundSnap: { type: "number", default: 0.18 }, // how far down to snap to ground
+          maxStep: { type: "number", default: 0.25 }, // small steps allowed
+          colliderSelector: { type: "string", default: "#galleryModel" } // GLB entity to collide with
+        },
+
+        init: function () {
+          this.keys = {};
+          this.velY = 0;
+          this.colliders = [];
+          this.raycaster = new THREE.Raycaster();
+          this.tempVec = new THREE.Vector3();
+          this.moveVec = new THREE.Vector3();
+          this.camEl = this.el.querySelector("[camera]") || document.querySelector("[camera]");
+
+          // Key handling
+          window.addEventListener("keydown", (e) => { this.keys[e.code] = true; });
+          window.addEventListener("keyup", (e) => { this.keys[e.code] = false; });
+
+          // Build collider list from GLB meshes
+          const glbEl = document.querySelector(this.data.colliderSelector);
+          if (glbEl) {
+            glbEl.addEventListener("model-loaded", () => {
+              const root = glbEl.getObject3D("mesh");
+              if (!root) return;
+              const meshes = [];
+              root.traverse((o) => {
+                if (o.isMesh) {
+                  // Ensure raycasting works
+                  o.raycast = THREE.Mesh.prototype.raycast;
+                  meshes.push(o);
+                }
+              });
+              this.colliders = meshes;
+              console.log("✅ Colliders ready:", this.colliders.length, "meshes");
+            });
+          }
+        },
+
+        // Raycast helper
+        cast: function (origin, dir, far) {
+          if (!this.colliders || this.colliders.length === 0) return null;
+          this.raycaster.set(origin, dir);
+          this.raycaster.far = far;
+          const hits = this.raycaster.intersectObjects(this.colliders, true);
+          return hits.length ? hits[0] : null;
+        },
+
+        tick: function (time, dt) {
+          if (!dt) return;
+          const delta = Math.min(dt / 1000, 0.033);
+
+          // If colliders not ready yet, still allow movement without collision for a moment
+          const hasColliders = this.colliders && this.colliders.length > 0;
+
+          // Build input vector (WASD + arrow keys)
+          let x = 0, z = 0;
+          if (this.keys["KeyW"] || this.keys["ArrowUp"]) z -= 1;
+          if (this.keys["KeyS"] || this.keys["ArrowDown"]) z += 1;
+          if (this.keys["KeyA"] || this.keys["ArrowLeft"]) x -= 1;
+          if (this.keys["KeyD"] || this.keys["ArrowRight"]) x += 1;
+
+          // Normalize
+          this.moveVec.set(x, 0, z);
+          if (this.moveVec.lengthSq() > 0) this.moveVec.normalize();
+
+          // Convert move direction to world based on camera yaw
+          let yaw = 0;
+          if (this.camEl && this.camEl.object3D) {
+            // Use camera rotation, but only yaw
+            yaw = this.camEl.object3D.rotation.y;
+          }
+          const cos = Math.cos(yaw), sin = Math.sin(yaw);
+          const dirX = this.moveVec.x * cos - this.moveVec.z * sin;
+          const dirZ = this.moveVec.x * sin + this.moveVec.z * cos;
+
+          const step = this.data.speed * delta;
+          const nextPos = this.el.object3D.position.clone();
+          const curPos = this.el.object3D.position.clone();
+
+          // Try X move
+          if (dirX !== 0) {
+            const tryPos = nextPos.clone();
+            tryPos.x += dirX * step;
+            if (!hasColliders || !this.hitWall(curPos, tryPos)) nextPos.x = tryPos.x;
+          }
+
+          // Try Z move
+          if (dirZ !== 0) {
+            const tryPos = nextPos.clone();
+            tryPos.z += dirZ * step;
+            if (!hasColliders || !this.hitWall(curPos, tryPos)) nextPos.z = tryPos.z;
+          }
+
+          // Gravity + ground snap
+          if (hasColliders) {
+            const footPos = nextPos.clone();
+            footPos.y += 0.6; // cast from above head
+
+            const hitDown = this.cast(
+              footPos,
+              new THREE.Vector3(0, -1, 0),
+              10
+            );
+
+            if (hitDown) {
+              const groundY = hitDown.point.y;
+              const desiredY = groundY; // rig sits on ground
+
+              const distToGround = (nextPos.y - desiredY);
+
+              // snap if close enough OR falling
+              if (distToGround <= this.data.groundSnap || this.velY < 0) {
+                nextPos.y = desiredY;
+                this.velY = 0;
+              } else {
+                // fall
+                this.velY -= this.data.gravity * delta;
+                nextPos.y += this.velY * delta;
+              }
+            } else {
+              // no ground detected -> fall
+              this.velY -= this.data.gravity * delta;
+              nextPos.y += this.velY * delta;
+            }
+          }
+
+          // Apply final position
+          this.el.object3D.position.copy(nextPos);
+        },
+
+        // Collision check against walls/objects using short ray in move direction
+        hitWall: function (fromPos, toPos) {
+          const move = toPos.clone().sub(fromPos);
+          const dist = move.length();
+          if (dist <= 0.0001) return false;
+
+          const dir = move.normalize();
+
+          // Ray from chest height
+          const origin = fromPos.clone();
+          origin.y += this.data.eyeHeight * 0.55;
+
+          // Slightly forward from origin so we don't instantly collide with ourselves
+          origin.add(dir.clone().multiplyScalar(0.02));
+
+          const hit = this.cast(origin, dir, this.data.radius + dist);
+          if (!hit) return false;
+
+          // Allow stepping up small height differences (stairs/curbs)
+          const heightDiff = hit.point.y - fromPos.y;
+          if (heightDiff <= this.data.maxStep) return false;
+
+          return true;
+        }
+      });
+
+      // =========================================
+      // PROXIMITY NARRATION (invisible hotspots)
+      // =========================================
+      AFRAME.registerComponent("proximity-narration", {
+        schema: {
+          title: { type: "string", default: "Artwork" },
+          text: { type: "string", default: "Description..." },
+          radius: { type: "number", default: 1.6 },
+          audio: { type: "selector" },  // <audio id="...">
+          stopOnExit: { type: "boolean", default: true },
+          cooldown: { type: "number", default: 1200 }
+        },
+
+        init: function () {
+          this.cameraEl = null;
+          this.playing = false;
+          this.lastTriggerTime = 0;
+
+          // ✅ Force src to "#id" string (reliable)
+          const audioId = this.data.audio && this.data.audio.id ? `#${this.data.audio.id}` : "";
+
+          this.soundEl = document.createElement("a-entity");
+          this.soundEl.setAttribute("sound", {
+            src: audioId,
+            autoplay: false,
+            loop: false,
+            positional: true,
+            volume: 1
+          });
+          this.el.appendChild(this.soundEl);
+        },
+
+        tick: function () {
+          if (!this.cameraEl) {
+            this.cameraEl = document.querySelector("[camera]");
+            if (!this.cameraEl) return;
+          }
+
+          const now = Date.now();
+
+          const camPos = new THREE.Vector3();
+          const myPos = new THREE.Vector3();
+          this.cameraEl.object3D.getWorldPosition(camPos);
+          this.el.object3D.getWorldPosition(myPos);
+
+          const dist = camPos.distanceTo(myPos);
+
+          if (dist <= this.data.radius && !this.playing) {
+            if (now - this.lastTriggerTime < this.data.cooldown) return;
+            this.lastTriggerTime = now;
+            this.playing = true;
+
+            if (currentlyPlayingSoundEntity && currentlyPlayingSoundEntity !== this.soundEl) {
+              if (currentlyPlayingSoundEntity.components.sound) {
+                currentlyPlayingSoundEntity.components.sound.stopSound();
+              }
+            }
+
+            const ui = document.getElementById("ui");
+            ui.style.display = "block";
+            document.getElementById("uiTitle").textContent = this.data.title;
+            document.getElementById("uiText").textContent = this.data.text;
+
+            if (audioUnlocked && this.soundEl.components.sound) {
+              this.soundEl.components.sound.playSound();
+              currentlyPlayingSoundEntity = this.soundEl;
+            }
+          }
+
+          if (dist > this.data.radius && this.playing && this.data.stopOnExit) {
+            this.playing = false;
+
+            if (currentlyPlayingSoundEntity === this.soundEl) {
+              if (this.soundEl.components.sound) this.soundEl.components.sound.stopSound();
+              currentlyPlayingSoundEntity = null;
+            }
+          }
+        }
+      });
+
+      // =========================================
+      // QUIZ
+      // =========================================
+      const quizData = [
+        { q: "Which art style focuses on shapes, colors, and forms rather than realistic representation?",
+          options: ["Realism", "Abstract", "Baroque", "Renaissance"], answer: 1 },
+        { q: "Which material is commonly used in sculpture?",
+          options: ["Marble", "Water", "Paper", "Steam"], answer: 0 },
+        { q: "A portrait artwork mainly shows…",
+          options: ["Buildings", "A person", "A mountain", "A car"], answer: 1 },
+        { q: "Which term describes strong light-and-shadow contrast used to create drama in art?",
+          options: ["Chiaroscuro", "Cubism", "Impressionism", "Minimalism"], answer: 0 },
+        { q: "Which is a primary color in painting?",
+          options: ["Green", "Purple", "Red", "Pink"], answer: 2 },
+        { q: "A ‘still life’ artwork usually shows…",
+          options: ["Fast-moving sports", "Objects like fruit/flowers", "Only landscapes", "Only portraits"], answer: 1 },
+        { q: "Which element of art refers to surface quality (smooth, rough, etc.)?",
+          options: ["Texture", "Hue", "Perspective", "Balance"], answer: 0 },
+        { q: "What does ‘composition’ mean in visual art?",
+          options: ["How music is arranged", "How elements are arranged in the artwork", "How paint is manufactured", "How a frame is built"], answer: 1 },
+        { q: "Which technique makes distant objects appear smaller to create depth?",
+          options: ["Perspective", "Collage", "Monochrome", "Engraving"], answer: 0 },
+        { q: "A museum or gallery ‘curator’ mainly…",
+          options: ["Sells tickets only", "Selects and organizes artworks for display", "Paints all the artworks", "Builds the walls"], answer: 1 }
+      ];
+
+      let quizIndex = 0;
+      let score = 0;
+
+      function openQuiz() {
+        quizIndex = 0;
+        score = 0;
+        document.getElementById("quizFeedback").textContent = "";
+        document.getElementById("quizModal").style.display = "block";
+        renderQuizQuestion();
+      }
+      function closeQuiz() { document.getElementById("quizModal").style.display = "none"; }
+
+      function renderQuizQuestion() {
+        const item = quizData[quizIndex];
+        document.getElementById("quizTitle").textContent = `Gallery Quiz (${quizIndex + 1}/${quizData.length})`;
+        document.getElementById("quizQuestion").textContent = item.q;
+
+        const opts = document.getElementById("quizOptions");
+        opts.innerHTML = "";
+
+        item.options.forEach((text, i) => {
+          const btn = document.createElement("button");
+          btn.className = "opt";
+          btn.textContent = text;
+          btn.onclick = () => selectAnswer(i);
+          opts.appendChild(btn);
+        });
+      }
+
+      function selectAnswer(i) {
+        const item = quizData[quizIndex];
+        const feedback = document.getElementById("quizFeedback");
+
+        if (i === item.answer) { score++; feedback.textContent = "✅ Correct!"; }
+        else { feedback.textContent = `❌ Nope. Correct answer: ${item.options[item.answer]}`; }
+
+        setTimeout(() => {
+          quizIndex++;
+          feedback.textContent = "";
+          if (quizIndex < quizData.length) renderQuizQuestion();
+          else {
+            document.getElementById("quizTitle").textContent = "Quiz Completed!";
+            document.getElementById("quizQuestion").textContent = `Your score: ${score}/${quizData.length}`;
+            document.getElementById("quizOptions").innerHTML = "";
+          }
+        }, 650);
+      }
+
+      window.addEventListener("DOMContentLoaded", () => {
+        document.getElementById("quizBackdrop").addEventListener("click", closeQuiz);
+        document.getElementById("quizClose").addEventListener("click", closeQuiz);
+        document.getElementById("quizRestart").addEventListener("click", openQuiz);
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape" && document.getElementById("quizModal").style.display === "block") closeQuiz();
+        });
+      });
+
+      AFRAME.registerComponent("tv-quiz", {
+        init: function () { this.el.addEventListener("click", () => openQuiz()); }
+      });
+
+      // =========================================
+      // TV clickable area: invisible plane attached to node "television"
+      // =========================================
+      AFRAME.registerComponent("attach-click-to-node", {
+        schema: {
+          node: { type: "string", default: "television" },
+          pad: { type: "number", default: 0.08 },
+          forward: { type: "number", default: 0.03 },
+          rotOffsetY: { type: "number", default: 90 }
+        },
+
+        init: function () {
+          this.el.addEventListener("model-loaded", () => {
+            const root = this.el.getObject3D("mesh");
+            if (!root) return;
+
+            const target = root.getObjectByName(this.data.node);
+            if (!target) {
+              console.warn("❌ Could not find node in GLB:", this.data.node);
+              return;
+            }
+
+            const box = new THREE.Box3().setFromObject(target);
+            const size = new THREE.Vector3();
+            box.getSize(size);
+
+            const w = Math.max(0.2, size.x + this.data.pad);
+            const h = Math.max(0.2, size.y + this.data.pad);
+
+            const worldPos = new THREE.Vector3();
+            target.getWorldPosition(worldPos);
+
+            const worldQuat = new THREE.Quaternion();
+            target.getWorldQuaternion(worldQuat);
+
+            const galleryRoot = document.getElementById("galleryRoot");
+            const parentObj = galleryRoot.object3D;
+
+            const localPos = worldPos.clone();
+            parentObj.worldToLocal(localPos);
+
+            const parentQuat = new THREE.Quaternion();
+            parentObj.getWorldQuaternion(parentQuat);
+            const localQuat = worldQuat.clone().premultiply(parentQuat.invert());
+            const euler = new THREE.Euler().setFromQuaternion(localQuat, "YXZ");
+
+            const clickEnt = document.createElement("a-entity");
+            clickEnt.setAttribute("position", `${localPos.x} ${localPos.y} ${localPos.z}`);
+
+            const rx = THREE.MathUtils.radToDeg(euler.x);
+            const ry = THREE.MathUtils.radToDeg(euler.y) + this.data.rotOffsetY;
+            const rz = THREE.MathUtils.radToDeg(euler.z);
+            clickEnt.setAttribute("rotation", `${rx} ${ry} ${rz}`);
+
+            const plane = document.createElement("a-plane");
+            plane.classList.add("clickable");
+            plane.setAttribute("tv-quiz", "");
+            plane.setAttribute("width", w);
+            plane.setAttribute("height", h);
+            plane.setAttribute("position", `0 0 ${this.data.forward}`);
+            plane.setAttribute("material", "opacity: 0; transparent: true; side: double;");
+
+            clickEnt.appendChild(plane);
+            galleryRoot.appendChild(clickEnt);
+          });
+        }
+      });
+    </script>
+  </head>
+
+  <body>
+    <div id="hint">
+      <strong>WASD</strong> move • <strong>Mouse</strong> look • Click once anywhere to enable audio • Collisions ON • Click TV to open quiz
+    </div>
+
+    <div id="ui">
+      <h3 id="uiTitle"></h3>
+      <p id="uiText"></p>
+    </div>
+
+    <!-- QUIZ MODAL -->
+    <div id="quizModal">
+      <div id="quizBackdrop"></div>
+      <div id="quizCard">
+        <h2 id="quizTitle"></h2>
+        <p id="quizQuestion"></p>
+        <div id="quizOptions"></div>
+        <div id="quizFooter">
+          <span id="quizFeedback"></span>
+          <div style="display:flex; gap:10px;">
+            <button id="quizClose" class="btn btnGhost">Close</button>
+            <button id="quizRestart" class="btn btnPrimary">Restart</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <a-scene>
+      <a-assets>
+        <a-asset-item id="gallery" src="models/gallery.glb"></a-asset-item>
+
+        <audio id="aud-p1" src="audio/painting1.mp3" preload="auto" crossorigin="anonymous"></audio>
+        <audio id="aud-p2" src="audio/painting2.mp3" preload="auto" crossorigin="anonymous"></audio>
+        <audio id="aud-p3" src="audio/painting3.mp3" preload="auto" crossorigin="anonymous"></audio>
+        <audio id="aud-p4" src="audio/painting4.mp3" preload="auto" crossorigin="anonymous"></audio>
+        <audio id="aud-p5" src="audio/painting5.mp3" preload="auto" crossorigin="anonymous"></audio>
+      </a-assets>
+
+      <a-light type="ambient" intensity="0.6"></a-light>
+      <a-light type="directional" position="1 4 2" intensity="0.9"></a-light>
+
+      <a-entity id="galleryRoot" position="0 0 0" scale="1 1 1">
+        <!-- IMPORTANT: give the GLB entity an id so collisions can reference it -->
+        <a-entity
+          id="galleryModel"
+          gltf-model="#gallery"
+          attach-click-to-node="node: television; pad: 0.08; forward: 0.03; rotOffsetY: 90">
+        </a-entity>
+
+        <!-- Invisible proximity hotspots -->
+        <a-entity position="-1.7 0.2 0.2"
+          proximity-narration="title: Painting 01 — The Indian Potrait; text: Oil Painting • 2001. Blend of traditional and contemporary elements.; radius: 1.3; audio: #aud-p1; stopOnExit: true;">
+        </a-entity>
+
+        <a-entity position="2 0.2 2.1"
+          proximity-narration="title: Scuplture 02 — Budhha; text: Scuplture • 2003. Symbolism of peace and enlightenment.; radius: 1.3; audio: #aud-p2; stopOnExit: true;">
+        </a-entity>
+
+        <a-entity position="-1.7 0.2 1.5"
+          proximity-narration="title: Painting 02 — Abstract Potrait; text: Acrylic • 2005. A soft tension between realism and abstraction.; radius: 1.3; audio: #aud-p3; stopOnExit: true;">
+        </a-entity>
+
+        <a-entity position="2 0.2 -1.7"
+          proximity-narration="title: Painting 04 — Home of the Remnants; text: Digital print • 2007. Relics of different eras.; radius: 1.3; audio: #aud-p4; stopOnExit: true;">
+        </a-entity>
+
+        <a-entity position="-1.7 0.2 -1.7"
+          proximity-narration="title: Painting 05 — Fairy Lady; text: Digital Painting • 2006.The creation of fairy like lady.; radius: 1.3; audio: #aud-p5; stopOnExit: true;">
+        </a-entity>
+      </a-entity>
+
+      <!-- Camera Rig with COLLIDING CONTROLS -->
+      <a-entity id="rig"
+        position="0 0 0"
+        colliding-controls="speed: 2.6; radius: 0.25; eyeHeight: 0.9; colliderSelector: #galleryModel">
+
+        <a-camera
+          position="0 0.9 0"
+          look-controls="pointerLockEnabled: true">
+
+          <!-- Mouse click raycaster (no visible ring) -->
+          <a-entity
+            cursor="rayOrigin: mouse; fuse: false"
+            raycaster="objects: .clickable; far: 30">
+          </a-entity>
+
+        </a-camera>
+      </a-entity>
+
+      <a-sky color="#ECECEC"></a-sky>
+    </a-scene>
+  </body>
+</html>

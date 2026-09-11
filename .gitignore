@@ -1,0 +1,12 @@
+# OS junk files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor folders
+.vscode/
+.idea/
+
+# Local env files (if added later)
+.env
+.env.local
