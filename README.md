@@ -30,6 +30,6 @@ npx serve .
 
 Then open the local URL it prints in your browser.
 
-## Screenshots / walkthrough
+## Screenshot
 
-_TODO: add screenshots and a walkthrough GIF here._
+<img src="screenshots/ArtExhibition01.png" width="700"/>
